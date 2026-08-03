@@ -363,13 +363,20 @@ class RDTModel(nn.Module):
             else:
                 block_pos_emb = position_embeddings
 
+            # Determine attention mask for this block (Gemma 4 dict-based)
+            if isinstance(attention_mask, dict) and block_layer_types:
+                lt = block_layer_types[i]
+                block_attn_mask = attention_mask.get(lt)
+            else:
+                block_attn_mask = attention_mask
+
             # Build kwargs for extra args (e.g. shared_kv_states for Gemma 4)
             extra_kwargs = {arg: None for arg in self._block_extra_args}
 
             if self._block_forward_style == "v5_position_embeddings":
                 outputs = block(
                     h,
-                    attention_mask=attention_mask,
+                    attention_mask=block_attn_mask,
                     position_ids=position_ids,
                     position_embeddings=block_pos_emb,
                     use_cache=False,
@@ -379,7 +386,7 @@ class RDTModel(nn.Module):
             elif self._block_forward_style == "v4_position_ids":
                 outputs = block(
                     h,
-                    attention_mask=attention_mask,
+                    attention_mask=block_attn_mask,
                     position_ids=position_ids,
                     use_cache=False,
                     **extra_kwargs,
@@ -387,7 +394,7 @@ class RDTModel(nn.Module):
             else:
                 # legacy or unknown
                 try:
-                    outputs = block(h, attention_mask=attention_mask, use_cache=False, **extra_kwargs)
+                    outputs = block(h, attention_mask=block_attn_mask, use_cache=False, **extra_kwargs)
                 except TypeError:
                     outputs = block(h)
 
@@ -425,10 +432,22 @@ class RDTModel(nn.Module):
         # 2. Compute position embeddings if needed (v5 models)
         position_embeddings = self._get_position_embeddings(h, position_ids)
 
+        # 2b. For Gemma 4 hybrid attention, create dict-based attention mask
+        block_attention_mask = attention_mask
+        if self._has_layer_types and attention_mask is not None and not isinstance(attention_mask, dict):
+            # Gemma 4 expects a dict keyed by layer_type
+            from collections import UserDict
+            block_attention_mask = {
+                lt: attention_mask for lt in self._unique_layer_types
+            }
+        elif self._has_layer_types and attention_mask is None:
+            # No mask provided — pass None for each layer type
+            block_attention_mask = {lt: None for lt in self._unique_layer_types}
+
         # 3. Prelude (run once, frozen)
         h = self._run_blocks(
             self.prelude_blocks, h,
-            attention_mask=attention_mask,
+            attention_mask=block_attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
             block_layer_types=self._prelude_layer_types if self._has_layer_types else None,
@@ -438,7 +457,7 @@ class RDTModel(nn.Module):
         e = h  # encoded input, frozen for injection each loop
         block_forward = lambda combined: self._run_blocks(
             self.recurrent_blocks, combined,
-            attention_mask=attention_mask,
+            attention_mask=block_attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
             block_layer_types=self._recurrent_layer_types if self._has_layer_types else None,
@@ -448,7 +467,7 @@ class RDTModel(nn.Module):
         # 5. Coda (run once, frozen)
         h = self._run_blocks(
             self.coda_blocks, h,
-            attention_mask=attention_mask,
+            attention_mask=block_attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
             block_layer_types=self._coda_layer_types if self._has_layer_types else None,
