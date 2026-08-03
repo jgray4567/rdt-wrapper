@@ -1,0 +1,10 @@
+torch>=2.0
+transformers>=4.40
+numpy>=1.24
+
+[dev]
+pytest>=7.0
+pytest-xdist
+
+[flash]
+flash-attn>=2.0
