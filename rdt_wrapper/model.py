@@ -113,46 +113,46 @@ class RDTModel(nn.Module):
         )
 
         # --- Transformer blocks ---
-        all_blocks = self._get_attr(
-            text_model,
-            ["layers", "model.layers", "blocks", "h"],
-            default=self._get_attr(
+        # Use try/except instead of default= to avoid eager evaluation
+        try:
+            all_blocks = self._get_attr(text_model, ["layers", "model.layers", "blocks", "h"])
+        except AttributeError:
+            all_blocks = self._get_attr(
                 base_model,
                 ["model.layers", "layers", "transformer.h", "h", "model.blocks", "blocks"],
-            ),
-        )
+            )
         all_blocks = list(all_blocks)
 
         # --- Final norm ---
-        self.final_norm = self._get_attr(
-            text_model,
-            ["norm", "final_layernorm", "final_norm", "ln_f"],
-            default=self._get_attr(
-                base_model,
-                ["model.norm", "norm", "model.model.norm",
-                 "transformer.ln_f", "ln_f", "model.final_layernorm",
-                 "final_layernorm", "model.final_norm"],
-                default=nn.Identity(),
-            ),
-        )
+        try:
+            self.final_norm = self._get_attr(text_model, ["norm", "final_layernorm", "final_norm", "ln_f"])
+        except AttributeError:
+            try:
+                self.final_norm = self._get_attr(
+                    base_model,
+                    ["model.norm", "norm", "model.model.norm",
+                     "transformer.ln_f", "ln_f", "model.final_layernorm",
+                     "final_layernorm", "model.final_norm"],
+                )
+            except AttributeError:
+                self.final_norm = nn.Identity()
 
         # --- LM head ---
-        self.lm_head = self._get_attr(
-            base_model,
-            ["lm_head", "model.lm_head"],
-            default=self.embed,
-        )
+        try:
+            self.lm_head = self._get_attr(base_model, ["lm_head", "model.lm_head"])
+        except AttributeError:
+            self.lm_head = self.embed
 
         # --- Rotary embeddings (transformers v5+) ---
-        self._rotary_emb = self._get_attr(
-            text_model,
-            ["rotary_emb"],
-            default=self._get_attr(
-                base_model,
-                ["model.rotary_emb", "rotary_emb", "model.model.rotary_emb"],
-                default=None,
-            ),
-        )
+        try:
+            self._rotary_emb = self._get_attr(text_model, ["rotary_emb"])
+        except AttributeError:
+            try:
+                self._rotary_emb = self._get_attr(
+                    base_model, ["model.rotary_emb", "rotary_emb", "model.model.rotary_emb"]
+                )
+            except AttributeError:
+                self._rotary_emb = None
 
         # --- Detect block forward signature ---
         self._block_forward_style = self._detect_block_forward(all_blocks[0])
