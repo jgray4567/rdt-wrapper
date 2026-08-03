@@ -88,32 +88,55 @@ class RDTModel(nn.Module):
         Args:
             base_model: The pretrained model to extract from.
         """
+        # --- Find the text model ---
+        # Most models: text layers are at model.model.layers
+        # Gemma 4 (unified/multimodal): text layers are at model.model.language_model.layers
+        # We try both paths to stay model-agnostic.
+        text_model = None
+        for path in ["model.language_model", "language_model", "model.text_model", "text_model"]:
+            try:
+                text_model = self._get_attr(base_model, [path])
+                break
+            except AttributeError:
+                continue
+        if text_model is None:
+            # Standard path — text model IS model.model (or model itself)
+            try:
+                text_model = self._get_attr(base_model, ["model", "model.model"])
+            except AttributeError:
+                text_model = base_model  # last resort: model itself
+
         # --- Embedding ---
         self.embed = self._get_attr(
-            base_model,
-            ["model.embed_tokens", "embed_tokens", "model.model.embed_tokens",
-             "transformer.wte", "model.wte"],
+            text_model,
+            ["embed_tokens", "model.embed_tokens"],
         )
 
         # --- Transformer blocks ---
         all_blocks = self._get_attr(
-            base_model,
-            ["model.layers", "layers", "model.model.layers",
-             "transformer.h", "h", "model.blocks", "blocks"],
+            text_model,
+            ["layers", "model.layers", "blocks", "h"],
+            default=self._get_attr(
+                base_model,
+                ["model.layers", "layers", "transformer.h", "h", "model.blocks", "blocks"],
+            ),
         )
         all_blocks = list(all_blocks)
 
         # --- Final norm ---
         self.final_norm = self._get_attr(
-            base_model,
-            ["model.norm", "norm", "model.model.norm",
-             "transformer.ln_f", "ln_f", "model.final_layernorm",
-             "final_layernorm", "model.final_norm"],
-            default=nn.Identity(),
+            text_model,
+            ["norm", "final_layernorm", "final_norm", "ln_f"],
+            default=self._get_attr(
+                base_model,
+                ["model.norm", "norm", "model.model.norm",
+                 "transformer.ln_f", "ln_f", "model.final_layernorm",
+                 "final_layernorm", "model.final_norm"],
+                default=nn.Identity(),
+            ),
         )
 
         # --- LM head ---
-        # Try explicit lm_head; fall back to tied embeddings
         self.lm_head = self._get_attr(
             base_model,
             ["lm_head", "model.lm_head"],
@@ -121,16 +144,21 @@ class RDTModel(nn.Module):
         )
 
         # --- Rotary embeddings (transformers v5+) ---
-        # Newer transformers versions moved RoPE to the model level and require
-        # position_embeddings to be passed explicitly to each block.
         self._rotary_emb = self._get_attr(
-            base_model,
-            ["model.rotary_emb", "rotary_emb", "model.model.rotary_emb"],
-            default=None,
+            text_model,
+            ["rotary_emb"],
+            default=self._get_attr(
+                base_model,
+                ["model.rotary_emb", "rotary_emb", "model.model.rotary_emb"],
+                default=None,
+            ),
         )
 
         # --- Detect block forward signature ---
         self._block_forward_style = self._detect_block_forward(all_blocks[0])
+
+        # --- Detect extra block forward args (e.g. shared_kv_states for Gemma 4) ---
+        self._block_extra_args = self._detect_block_extra_args(all_blocks[0])
 
         # --- Detect Gemma 4 hybrid attention (layer_types) ---
         # Gemma 4 uses different rotary embeddings per layer type
@@ -209,8 +237,6 @@ class RDTModel(nn.Module):
     def _detect_block_forward(block: nn.Module) -> str:
         """Detect the block's forward signature style.
 
-        Inspects the forward method signature to determine how to call it.
-
         Returns one of:
             - 'v5_position_embeddings': block(h, position_embeddings=(cos,sin), ...)
             - 'v4_position_ids': block(h, position_ids=..., ...)
@@ -227,6 +253,26 @@ class RDTModel(nn.Module):
                 return "legacy"
         except (ValueError, TypeError):
             return "legacy"
+
+    @staticmethod
+    def _detect_block_extra_args(block: nn.Module) -> List[str]:
+        """Detect extra (non-standard) args in block forward beyond the usual set.
+
+        Standard args: hidden_states, attention_mask, position_ids,
+        position_embeddings, past_key_values, past_key_value, use_cache, kwargs.
+
+        Returns a list of extra arg names that need to be passed (as None).
+        e.g. ['shared_kv_states'] for Gemma 4.
+        """
+        standard = {"self", "hidden_states", "attention_mask", "position_ids",
+                    "position_embeddings", "past_key_values", "past_key_value",
+                    "use_cache", "kwargs"}
+        try:
+            sig = inspect.signature(block.forward)
+            extra = [name for name in sig.parameters if name not in standard]
+            return extra
+        except (ValueError, TypeError):
+            return []
 
     def freeze_base(self):
         """Freeze all pretrained model weights."""
@@ -314,6 +360,9 @@ class RDTModel(nn.Module):
             else:
                 block_pos_emb = position_embeddings
 
+            # Build kwargs for extra args (e.g. shared_kv_states for Gemma 4)
+            extra_kwargs = {arg: None for arg in self._block_extra_args}
+
             if self._block_forward_style == "v5_position_embeddings":
                 outputs = block(
                     h,
@@ -322,6 +371,7 @@ class RDTModel(nn.Module):
                     position_embeddings=block_pos_emb,
                     use_cache=False,
                     past_key_value=None,
+                    **extra_kwargs,
                 )
             elif self._block_forward_style == "v4_position_ids":
                 outputs = block(
@@ -329,11 +379,12 @@ class RDTModel(nn.Module):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     use_cache=False,
+                    **extra_kwargs,
                 )
             else:
                 # legacy or unknown
                 try:
-                    outputs = block(h, attention_mask=attention_mask, use_cache=False)
+                    outputs = block(h, attention_mask=attention_mask, use_cache=False, **extra_kwargs)
                 except TypeError:
                     outputs = block(h)
 
