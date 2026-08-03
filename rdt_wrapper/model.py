@@ -76,6 +76,9 @@ class RDTModel(nn.Module):
         model._load_base_model(base_model)
         model.freeze_base()
         model._base_param_count = sum(p.numel() for p in base_model.parameters())
+        # Cast wrapper params to match base model dtype (e.g. bfloat16)
+        base_dtype = next(base_model.parameters()).dtype
+        model.recurrent = model.recurrent.to(base_dtype)
         return model
 
     def _load_base_model(self, base_model: nn.Module):
