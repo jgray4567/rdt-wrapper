@@ -132,6 +132,37 @@ class RDTModel(nn.Module):
         # --- Detect block forward signature ---
         self._block_forward_style = self._detect_block_forward(all_blocks[0])
 
+        # --- Detect Gemma 4 hybrid attention (layer_types) ---
+        # Gemma 4 uses different rotary embeddings per layer type
+        # (sliding_attention vs full_attention). The rotary emb takes a
+        # `layer_type` argument and the model computes a dict of position
+        # embeddings keyed by layer_type.
+        self._has_layer_types = False
+        self._layer_types: List[str] = []
+        self._unique_layer_types: List[str] = []
+        base_config = getattr(base_model, "config", None)
+        if base_config is not None:
+            # Gemma 4 nests text config under text_config
+            text_config = getattr(base_config, "text_config", base_config)
+            layer_types = getattr(text_config, "layer_types", None)
+            if layer_types is not None:
+                self._has_layer_types = True
+                self._layer_types = list(layer_types)
+                self._unique_layer_types = list(set(layer_types))
+
+        # Also check if rotary emb forward takes layer_type arg
+        if self._rotary_emb is not None and not self._has_layer_types:
+            try:
+                rot_sig = inspect.signature(self._rotary_emb.forward)
+                if "layer_type" in rot_sig.parameters:
+                    # Rotary emb supports layer_type but config didn't specify
+                    # Default to a single layer type
+                    self._has_layer_types = True
+                    self._layer_types = ["full_attention"] * len(all_blocks)
+                    self._unique_layer_types = ["full_attention"]
+            except (ValueError, TypeError):
+                pass
+
         # --- Split blocks into prelude / recurrent / coda ---
         n_prelude = self.config.prelude_layers
         n_coda = self.config.coda_layers
@@ -146,6 +177,16 @@ class RDTModel(nn.Module):
         self.prelude_blocks = nn.ModuleList(all_blocks[:n_prelude])
         self.recurrent_blocks = nn.ModuleList(all_blocks[n_prelude:n_prelude + n_recurrent])
         self.coda_blocks = nn.ModuleList(all_blocks[n_prelude + n_recurrent:])
+
+        # Store per-block layer types for position embedding lookup
+        if self._has_layer_types:
+            self._prelude_layer_types = self._layer_types[:n_prelude]
+            self._recurrent_layer_types = self._layer_types[n_prelude:n_prelude + n_recurrent]
+            self._coda_layer_types = self._layer_types[n_prelude + n_recurrent:]
+        else:
+            self._prelude_layer_types = [None] * n_prelude
+            self._recurrent_layer_types = [None] * n_recurrent
+            self._coda_layer_types = [None] * max(n_coda, 0)
 
     @staticmethod
     def _get_attr(obj, paths, default=None):
@@ -212,18 +253,27 @@ class RDTModel(nn.Module):
         return [p for p in self.parameters() if not p.requires_grad]
 
     def _get_position_embeddings(self, h: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
-        """Compute position embeddings (cos, sin) if the model needs them.
+        """Compute position embeddings if the model needs them.
 
         Returns:
-            (cos, sin) tuple, or None if the model doesn't use explicit position embeddings.
+            For standard models: (cos, sin) tuple, or None.
+            For Gemma 4 (layer_types): dict[str, (cos, sin)] keyed by layer_type.
         """
         if self._rotary_emb is None:
             return None
         # Generate position_ids if not provided
         if position_ids is None:
             position_ids = torch.arange(h.shape[1], device=h.device).unsqueeze(0)
-        # HuggingFace rotary emb returns (cos, sin) given hidden_states and position_ids
-        return self._rotary_emb(h, position_ids=position_ids)
+        
+        if self._has_layer_types:
+            # Gemma 4: compute position embeddings per layer type
+            pos_emb_dict = {}
+            for layer_type in self._unique_layer_types:
+                pos_emb_dict[layer_type] = self._rotary_emb(h, position_ids, layer_type)
+            return pos_emb_dict
+        else:
+            # Standard: single (cos, sin) tuple
+            return self._rotary_emb(h, position_ids=position_ids)
 
     def _run_blocks(
         self,
@@ -231,7 +281,8 @@ class RDTModel(nn.Module):
         h: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        position_embeddings=None,
+        block_layer_types: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """Run a list of transformer blocks with the correct forward signature.
 
@@ -240,23 +291,35 @@ class RDTModel(nn.Module):
           - v4: block(h, position_ids=..., attention_mask=..., ...)
           - legacy: block(h, attention_mask=..., ...)
 
+        For Gemma 4 hybrid attention, position_embeddings is a dict keyed by
+        layer_type, and each block gets its own layer_type's embeddings.
+
         Args:
             blocks: List of transformer block modules.
             h: Hidden states, shape (B, T, dim).
             attention_mask: Optional attention mask.
             position_ids: Optional position IDs.
-            position_embeddings: Optional (cos, sin) tuple for v5 models.
+            position_embeddings: (cos, sin) tuple OR dict[str, (cos, sin)] for Gemma 4.
+            block_layer_types: Per-block layer types for Gemma 4 dict lookup.
 
         Returns:
             Updated hidden states, shape (B, T, dim).
         """
-        for block in blocks:
+        for i, block in enumerate(blocks):
+            # Determine position embeddings for this block
+            if position_embeddings is not None and isinstance(position_embeddings, dict):
+                # Gemma 4: dict keyed by layer_type
+                lt = block_layer_types[i] if block_layer_types else None
+                block_pos_emb = position_embeddings.get(lt) if lt else None
+            else:
+                block_pos_emb = position_embeddings
+
             if self._block_forward_style == "v5_position_embeddings":
                 outputs = block(
                     h,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    position_embeddings=position_embeddings,
+                    position_embeddings=block_pos_emb,
                     use_cache=False,
                     past_key_value=None,
                 )
@@ -268,7 +331,7 @@ class RDTModel(nn.Module):
                     use_cache=False,
                 )
             else:
-                # legacy or unknown — try with minimal args, then fallback
+                # legacy or unknown
                 try:
                     outputs = block(h, attention_mask=attention_mask, use_cache=False)
                 except TypeError:
@@ -314,6 +377,7 @@ class RDTModel(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
+            block_layer_types=self._prelude_layer_types if self._has_layer_types else None,
         )
 
         # 4. Recurrent loop
@@ -323,6 +387,7 @@ class RDTModel(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
+            block_layer_types=self._recurrent_layer_types if self._has_layer_types else None,
         )
         h = self.recurrent(h, e, block_forward, n_loops=n_loops)
 
@@ -332,6 +397,7 @@ class RDTModel(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             position_embeddings=position_embeddings,
+            block_layer_types=self._coda_layer_types if self._has_layer_types else None,
         )
 
         # 6. Final norm + LM head
