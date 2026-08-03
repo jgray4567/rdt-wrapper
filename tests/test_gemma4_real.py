@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Test RDT wrapper against real Gemma 4 12B on Caesar."""
+"""Test RDT wrapper against real Gemma 4 12B.
+
+Run manually: python tests/test_gemma4_real.py
+Not collected by pytest (guarded by __main__ check).
+"""
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from rdt_wrapper.config import RDTConfig
 from rdt_wrapper.model import RDTModel
 import sys
 
-print("Loading Gemma 4 12B (bfloat16)...", flush=True)
-tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
-base_model = AutoModelForCausalLM.from_pretrained("google/gemma-4-12B-it", dtype=torch.bfloat16)
-print(f"Loaded. Class: {type(base_model).__name__}", flush=True)
+def main():
+    print("Loading Gemma 4 12B (bfloat16)...", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-12B-it")
+    base_model = AutoModelForCausalLM.from_pretrained("google/gemma-4-12B-it", dtype=torch.bfloat16)
+    print(f"Loaded. Class: {type(base_model).__name__}", flush=True)
 
-tc = base_model.config.text_config
-dim = tc.hidden_size
+    tc = base_model.config.text_config
+    dim = tc.hidden_size
 n_layers = tc.num_hidden_layers
 layer_types = getattr(tc, "layer_types", None)
 print(f"dim={dim}, layers={n_layers}", flush=True)
@@ -61,3 +66,6 @@ print(f"16 loops OK. Logits shape: {out16['logits'].shape}", flush=True)
 print(f"Finite: {torch.isfinite(out16['logits']).all().item()}", flush=True)
 
 print("\\nAll tests passed! RDT wrapper works with Gemma 4 12B.", flush=True)
+
+if __name__ == "__main__":
+    main()
